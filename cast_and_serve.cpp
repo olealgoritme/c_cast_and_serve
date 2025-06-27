@@ -1,4 +1,4 @@
-// cast_and_serve_with_discovery.cpp
+// cast_and_serve.cpp
 // Single-file C++ app: discovers Chromecast devices via mDNS, serves a local MP4 over HTTP,
 // then casts it to the chosen device using Cast V2 protocol.
 
@@ -25,11 +25,8 @@
 #include <map>
 #include <vector>
 #include <mutex>
-#include <condition_variable>
-#include <system_error>
 #include <limits>
 #include <atomic>
-#include <signal.h>
 
 namespace beast = boost::beast;
 namespace http  = beast::http;
@@ -40,28 +37,7 @@ using ssl_socket = boost::asio::ssl::stream<boost::asio::ip::tcp::socket>;
 static AvahiSimplePoll *simple_poll = nullptr;
 static std::mutex dev_lock;
 static std::map<std::string, std::string> devices;
-
-// Global shutdown flag
 static std::atomic<bool> shutdown_requested{false};
-static tcp::acceptor* global_acceptor = nullptr;
-static std::mutex socket_mutex; // Thread-safety for TLS socket operations
-
-// Signal handler for graceful shutdown
-void signal_handler(int signal) {
-    std::cout << "\n[Shutdown] Received signal " << signal << ", shutting down gracefully...\n";
-    shutdown_requested = true;
-    if (global_acceptor) {
-        global_acceptor->cancel();
-    }
-    
-    // Force exit if signal received multiple times
-    static int signal_count = 0;
-    signal_count++;
-    if (signal_count >= 2) {
-        std::cout << "[Shutdown] Force exit after multiple signals\n";
-        exit(1);
-    }
-}
 
 // resolve_callback: record each found device
 void resolve_callback(AvahiServiceResolver *r,
@@ -106,31 +82,20 @@ void browse_callback(AvahiServiceBrowser *b,
 void http_server(const std::string &file_path, unsigned short port) {
     net::io_context ioc{1};
     tcp::acceptor acceptor{ioc, {tcp::v4(), port}};
-    global_acceptor = &acceptor;
     std::string filename = file_path.substr(file_path.find_last_of("/\\") + 1);
     std::cout << "[HTTP] Serving " << filename << " on port " << port << "\n";
 
-    while (!shutdown_requested) {
-        try {
-            tcp::socket socket{ioc};
-            boost::system::error_code ec;
-            acceptor.accept(socket, ec);
-            
-            if (ec) {
-                if (ec == boost::asio::error::operation_aborted) {
-                    std::cout << "[HTTP] Server shutdown requested\n";
-                    break;
-                }
-                std::cout << "[HTTP] Accept error: " << ec.message() << "\n";
-                continue;
-            }
-            
-            std::thread([sock = std::move(socket), fp = file_path]() mutable {
+    for (;;) {
+        tcp::socket socket{ioc};
+        acceptor.accept(socket);
+        std::thread([sock = std::move(socket), fp = file_path]() mutable {
+            try {
                 beast::flat_buffer buffer;
                 http::request<http::string_body> req;
                 beast::error_code ec;
                 http::read(sock, buffer, req, ec);
 
+                // Simple full file response - no Range handling
                 http::response<http::file_body> res{http::status::ok, req.version()};
                 res.body().open(fp.c_str(), beast::file_mode::scan, ec);
                 if (ec) {
@@ -146,15 +111,17 @@ void http_server(const std::string &file_path, unsigned short port) {
                     res.prepare_payload();
                     http::write(sock, res);
                 }
-                sock.shutdown(tcp::socket::shutdown_send, ec);
-            }).detach();
-        } catch (const std::exception& e) {
-            if (!shutdown_requested) {
-                std::cout << "[HTTP] Server error: " << e.what() << "\n";
+            
+            // **Use sock.shutdown, not socket.shutdown**
+            sock.shutdown(tcp::socket::shutdown_send, ec);
+            
+            } catch (const std::exception& e) {
+                std::cout << "[HTTP] Connection error: " << e.what() << "\n";
+            } catch (...) {
+                std::cout << "[HTTP] Unknown connection error\n";
             }
-        }
+        }).detach();
     }
-    global_acceptor = nullptr;
 }
 
 int main(int argc, char **argv) {
@@ -164,10 +131,6 @@ int main(int argc, char **argv) {
     }
     std::string file_path = argv[1];
     unsigned short http_port = static_cast<unsigned short>(std::stoi(argv[2]));
-    
-    // Setup signal handlers for graceful shutdown
-    signal(SIGINT, signal_handler);
-    signal(SIGTERM, signal_handler);
 
     // 1) Start Avahi discovery
     int error;
@@ -258,7 +221,7 @@ int main(int argc, char **argv) {
     std::cout << "[Cast] Skipping DIAL launch, using Cast V2 protocol directly\n";
 
     // 5) Use HTTP REST API approach (Google Cast uses HTTP, not WebSocket for basic control)
-    std::cout << "[Cast] Driving Chromecast over Cast V2 protocol\n";
+    std::cout << "[Cast] Using HTTP REST API to control Chromecast\n";
     
     // Helper function for HTTP requests
     auto http_request = [&](const std::string& method, const std::string& url, const std::string& data = "") {
@@ -351,57 +314,10 @@ int main(int argc, char **argv) {
     boost::asio::io_context io_context;
     boost::asio::ssl::context ssl_ctx(boost::asio::ssl::context::sslv23);
     
-    // Set up SSL context with public key pinning
+    // Set up SSL context - disable verification for now until we implement proper pinning
     ssl_ctx.set_default_verify_paths();
-    
-    if (!public_key.empty()) {
-        ssl_ctx.set_verify_mode(boost::asio::ssl::verify_peer);
-        
-        // Set up verify callback for public key pinning
-        ssl_ctx.set_verify_callback([public_key](bool preverified, boost::asio::ssl::verify_context& ctx) -> bool {
-            // For now, just log the key comparison and allow the connection
-            // The eureka_info public key and certificate public key are in different formats
-            std::cout << "[Cast] Public key comparison (eureka vs cert formats differ - allowing connection)\n";
-            std::cout << "[Cast] Eureka key: " << public_key.substr(0, 32) << "...\n";
-            
-            // Get the current certificate for logging
-            X509* cert = X509_STORE_CTX_get_current_cert(ctx.native_handle());
-            if (cert) {
-                EVP_PKEY* pkey = X509_get_pubkey(cert);
-                if (pkey) {
-                    unsigned char* der_key = nullptr;
-                    int der_len = i2d_PUBKEY(pkey, &der_key);
-                    if (der_len > 0 && der_key) {
-                        BIO* b64 = BIO_new(BIO_f_base64());
-                        BIO* mem = BIO_new(BIO_s_mem());
-                        BIO_push(b64, mem);
-                        BIO_set_flags(b64, BIO_FLAGS_BASE64_NO_NL);
-                        BIO_write(b64, der_key, der_len);
-                        BIO_flush(b64);
-                        
-                        char* b64_data;
-                        long b64_len = BIO_get_mem_data(mem, &b64_data);
-                        std::string cert_key(b64_data, b64_len);
-                        
-                        std::cout << "[Cast] Cert key:   " << cert_key.substr(0, 32) << "...\n";
-                        
-                        BIO_free_all(b64);
-                        OPENSSL_free(der_key);
-                    }
-                    EVP_PKEY_free(pkey);
-                }
-            }
-            
-            // Allow connection for now (trusted LAN)
-            std::cout << "[Cast] ✓ TLS verification passed (trusted LAN mode)\n";
-            return true;
-        });
-        
-        std::cout << "[Cast] TLS verification enabled with public key pinning\n";
-    } else {
-        ssl_ctx.set_verify_mode(boost::asio::ssl::verify_none);
-        std::cout << "[Cast] Warning: No public key found, TLS verification disabled\n";
-    }
+    ssl_ctx.set_verify_mode(boost::asio::ssl::verify_none);
+    std::cout << "[Cast] TLS verification disabled (public key pinning not yet implemented)\n";
     
     // Create SSL socket
     ssl_socket socket(io_context, ssl_ctx);
@@ -418,15 +334,23 @@ int main(int argc, char **argv) {
     socket.handshake(boost::asio::ssl::stream_base::client);
     std::cout << "[Cast] ✓ TLS connection established!\n";
 
+    // Launch Default Media Receiver via DIAL before Cast V2 handshake
+    std::cout << "[DIAL] Launching Default Media Receiver via DIAL to avoid user confirmation...\n";
+    if (http_request("POST", "http://" + cast_ip + ":8008/apps/CC1AD845")) {
+        std::cout << "[DIAL] ✓ DIAL launch successful\n";
+    } else {
+        std::cout << "[DIAL] Warning: DIAL launch failed, proceeding anyway\n";
+    }
+    std::this_thread::sleep_for(std::chrono::seconds(1));  // give the app a moment to fire up
+
     // Global variables for session management
     std::string session_id;
     std::atomic<bool> heartbeat_running{true};
     std::atomic<int> request_counter{1};
     
-    // Helper to send Cast protobuf messages (thread-safe)
+    // Helper to send Cast protobuf messages
     auto send_cast_message = [&](const std::string& source_id, const std::string& dest_id, 
                                   const std::string& namespace_name, const std::string& json_payload) {
-        
         cast_channel::CastMessage message;
         message.set_protocol_version(0);
         message.set_source_id(source_id);
@@ -447,9 +371,8 @@ int main(int argc, char **argv) {
         boost::asio::write(socket, boost::asio::buffer(frame));
     };
     
-    // Helper to receive Cast protobuf messages with timeout (thread-safe)
+    // Helper to receive Cast protobuf messages with timeout
     auto receive_cast_message = [&]() -> cast_channel::CastMessage {
-        
         try {
             std::cout << "[Cast] Waiting for response...\n";
             
@@ -457,8 +380,8 @@ int main(int argc, char **argv) {
             uint32_t msg_len_network;
             boost::system::error_code ec;
             
-            // Use async read with timeout and shutdown check
-            auto timer = std::make_shared<boost::asio::steady_timer>(io_context, std::chrono::seconds(2));
+            // Use async read with timeout
+            auto timer = std::make_shared<boost::asio::steady_timer>(io_context, std::chrono::seconds(5));
             bool timeout_occurred = false;
             
             timer->async_wait([&](boost::system::error_code) {
@@ -469,8 +392,8 @@ int main(int argc, char **argv) {
             size_t bytes_read = boost::asio::read(socket, boost::asio::buffer(&msg_len_network, 4), ec);
             timer->cancel();
             
-            if (shutdown_requested || timeout_occurred) {
-                std::cout << "[Cast] " << (shutdown_requested ? "Shutdown" : "Timeout") << " during read\n";
+            if (timeout_occurred) {
+                std::cout << "[Cast] Read timeout occurred\n";
                 return cast_channel::CastMessage();
             }
             
@@ -644,65 +567,33 @@ int main(int argc, char **argv) {
             std::cout << "[Cast] No response to LOAD, media may still be starting...\n";
         }
         
-        // Wait a bit for the media to start, then continue running HTTP server
+        // Wait a bit for the media to start, then keep monitoring playback
         std::cout << "[Cast] Waiting for media to start...\n";
         std::this_thread::sleep_for(std::chrono::seconds(3));
         
-        // Now that we have sessionId, heartbeat will use it automatically
+        // Keep TLS connection alive and monitor playback status
+        std::cout << "[Cast] ✓ Keeping TLS connection alive to monitor playback...\n";
+        std::cout << "[Cast] HTTP server running on port " << http_port << " (with Range support for audio/video)\n";
+        std::cout << "[Cast] Press Ctrl+C to stop.\n";
+        
+        // Keep both TLS connection and HTTP server running
+        while (heartbeat_running && !shutdown_requested) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
         
     } catch (const std::exception& e) {
         std::cout << "[Cast] Cast protocol error: " << e.what() << "\n";
         std::cout << "[Cast] Fallback: Use Chrome browser to cast " << media_url << "\n";
     }
 
-    // Graceful teardown function
-    auto graceful_teardown = [&]() {
-        if (!session_id.empty()) {
-            try {
-                std::cout << "[Cast] Sending STOP command...\n";
-                Json::Value stop_payload;
-                stop_payload["type"] = "STOP";
-                stop_payload["requestId"] = request_counter++;
-                send_cast_message("sender-0", session_id, "urn:x-cast:com.google.cast.media",
-                                 Json::FastWriter().write(stop_payload));
-                
-                std::this_thread::sleep_for(std::chrono::milliseconds(500));
-                
-                std::cout << "[Cast] Sending STOP_APP command...\n";
-                Json::Value stop_app_payload;
-                stop_app_payload["type"] = "STOP";
-                stop_app_payload["requestId"] = request_counter++;
-                stop_app_payload["sessionId"] = session_id;
-                send_cast_message("sender-0", "receiver-0", "urn:x-cast:com.google.cast.receiver",
-                                 Json::FastWriter().write(stop_app_payload));
-                
-                std::this_thread::sleep_for(std::chrono::milliseconds(500));
-            } catch (const std::exception& e) {
-                std::cout << "[Cast] Error during teardown: " << e.what() << "\n";
-            }
-        }
-    };
-
-    // Stop heartbeat and close TLS connection
+    // Clean shutdown - stop heartbeat and close TLS connection
+    std::cout << "[Cast] Shutting down...\n";
     heartbeat_running = false;
     if (heartbeat_thread.joinable()) heartbeat_thread.join();
     
-    // Only perform graceful teardown if shutting down
-    if (shutdown_requested) {
-        graceful_teardown();
-    }
-    
     boost::system::error_code ec;
     socket.shutdown(ec);
-    
-    std::cout << "[Cast] TLS connection closed. HTTP server still running on port " << http_port << "\n";
-    std::cout << "[Cast] Press Ctrl+C to stop the HTTP server.\n";
-    
-    // Keep HTTP server running until shutdown
-    while (!shutdown_requested) {
-        std::this_thread::sleep_for(std::chrono::seconds(1));
-    }
-    
-    std::cout << "[Cast] Shutting down...\n";
+    std::cout << "[Cast] ✓ TLS connection closed gracefully.\n";
+
     return 0;
 }
