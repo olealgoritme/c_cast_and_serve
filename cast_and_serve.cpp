@@ -687,8 +687,8 @@ int main(int argc, char **argv) {
     heartbeat_running = false;
     if (heartbeat_thread.joinable()) heartbeat_thread.join();
     
-    // Perform graceful teardown if not already shutting down
-    if (!shutdown_requested) {
+    // Only perform graceful teardown if shutting down
+    if (shutdown_requested) {
         graceful_teardown();
     }
     
