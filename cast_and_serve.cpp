@@ -186,7 +186,7 @@ int main(int argc, char **argv) {
 
     // Get local IP address
     std::string local_ip;
-    {
+    try {
         net::io_context ioc;
         tcp::resolver resolver(ioc);
         tcp::resolver::results_type endpoints = resolver.resolve(tcp::v4(), cast_ip, "80");
@@ -194,6 +194,11 @@ int main(int argc, char **argv) {
         socket.connect(*endpoints.begin());
         local_ip = socket.local_endpoint().address().to_string();
         socket.close();
+        std::cout << "[DEBUG] Local IP: " << local_ip << std::endl;
+    } catch (const std::exception& e) {
+        std::cerr << "[ERROR] Failed to get local IP: " << e.what() << std::endl;
+        std::cerr << "[INFO] Using fallback method to get local IP..." << std::endl;
+        local_ip = "192.168.1.0"; // fallback - will be auto-detected by HTTP server
     }
 
     // 3) Launch HTTP server
@@ -276,6 +281,7 @@ int main(int argc, char **argv) {
     };
 
     // Step 1: Get device info and extract public key for TLS verification
+    std::cout << "[DEBUG] Getting device info from " << cast_ip << ":8008\n";
     std::string info_url = "http://" + cast_ip + ":8008/setup/eureka_info";
     CURL *info_curl = curl_easy_init();
     std::string eureka_response;
@@ -312,7 +318,7 @@ int main(int argc, char **argv) {
 
     // Step 2: Raw TLS TCP connection to port 8009 (NOT WebSocket!)
     boost::asio::io_context io_context;
-    boost::asio::ssl::context ssl_ctx(boost::asio::ssl::context::sslv23);
+    boost::asio::ssl::context ssl_ctx(boost::asio::ssl::context::tlsv12_client);
     
     // Set up SSL context - disable verification for now until we implement proper pinning
     ssl_ctx.set_default_verify_paths();
@@ -335,13 +341,15 @@ int main(int argc, char **argv) {
     std::cout << "[Cast] ✓ TLS connection established!\n";
 
     // Launch Default Media Receiver via DIAL before Cast V2 handshake
+    std::cout << "[DEBUG] About to launch DIAL app on " << cast_ip << ":8008\n";
     std::cout << "[DIAL] Launching Default Media Receiver via DIAL to avoid user confirmation...\n";
     if (http_request("POST", "http://" + cast_ip + ":8008/apps/CC1AD845")) {
         std::cout << "[DIAL] ✓ DIAL launch successful\n";
     } else {
         std::cout << "[DIAL] Warning: DIAL launch failed, proceeding anyway\n";
     }
-    std::this_thread::sleep_for(std::chrono::seconds(1));  // give the app a moment to fire up
+    std::this_thread::sleep_for(std::chrono::seconds(3));  // give the app more time to fire up
+    std::cout << "[DEBUG] About to attempt TLS connection to " << cast_ip << ":8009\n";
 
     // Global variables for session management
     std::string session_id;
