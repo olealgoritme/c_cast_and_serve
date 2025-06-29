@@ -40,6 +40,34 @@ static std::map<std::string, std::string> devices;
 static std::atomic<bool> shutdown_requested{false};
 
 // resolve_callback: record each found device
+std::string get_friendly_name(const std::string& ip) {
+    CURL* curl = curl_easy_init();
+    std::string response;
+    if (curl) {
+        std::string url = "http://" + ip + ":8008/setup/eureka_info";
+        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 2L);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, +[](void *contents, size_t size, size_t nmemb, void *userp) -> size_t {
+            static_cast<std::string*>(userp)->append(static_cast<char*>(contents), size * nmemb);
+            return size * nmemb;
+        });
+        CURLcode result = curl_easy_perform(curl);
+        curl_easy_cleanup(curl);
+        if (result == CURLE_OK) {
+            size_t name_pos = response.find("\"name\":");
+            if (name_pos != std::string::npos) {
+                size_t start = response.find("\"", name_pos + 7);
+                size_t end = response.find("\"", start + 1);
+                if (start != std::string::npos && end != std::string::npos) {
+                    return response.substr(start + 1, end - start - 1);
+                }
+            }
+        }
+    }
+    return "";
+}
+
 void resolve_callback(AvahiServiceResolver *r,
                       AvahiIfIndex, AvahiProtocol,
                       AvahiResolverEvent event, const char *name,
@@ -50,8 +78,9 @@ void resolve_callback(AvahiServiceResolver *r,
     if (event == AVAHI_RESOLVER_FOUND) {
         char addr[AVAHI_ADDRESS_STR_MAX];
         avahi_address_snprint(addr, sizeof(addr), address);
+        std::string friendly_name = get_friendly_name(addr);
         std::lock_guard<std::mutex> lk(dev_lock);
-        devices[name] = addr;
+        devices[friendly_name.empty() ? name : friendly_name] = addr;
     }
     avahi_service_resolver_free(r);
 }
