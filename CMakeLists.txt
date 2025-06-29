@@ -7,9 +7,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Install system dependencies (if not in CI)
 if(UNIX AND NOT DEFINED ENV{CI})
-  message(STATUS "Installing system packages via apt: libavahi-client-dev libcurl4-openssl-dev libboost-system-dev libboost-thread-dev pkg-config")
+  message(STATUS "Installing system packages via apt: libavahi-client-dev libcurl4-openssl-dev libboost-system-dev libboost-thread-dev pkg-config libprotobuf-dev")
   execute_process(COMMAND sudo apt-get update)
-  execute_process(COMMAND sudo apt-get install -y libavahi-client-dev libcurl4-openssl-dev libboost-system-dev libboost-thread-dev pkg-config)
+  execute_process(COMMAND sudo apt-get install -y libavahi-client-dev libcurl4-openssl-dev libboost-system-dev libboost-thread-dev pkg-config libprotobuf-dev)
 endif()
 
 # Find Avahi client only
