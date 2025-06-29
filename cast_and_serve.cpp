@@ -124,9 +124,9 @@ void http_server(const std::string &file_path, unsigned short port) {
                 beast::error_code ec;
                 http::read(sock, buffer, req, ec);
 
-                // Simple full file response - no Range handling
-                http::response<http::file_body> res{http::status::ok, req.version()};
-                res.body().open(fp.c_str(), beast::file_mode::scan, ec);
+                // Range request support for video seeking
+                beast::file file;
+                file.open(fp.c_str(), beast::file_mode::scan, ec);
                 if (ec) {
                     http::response<http::string_body> err{http::status::not_found, req.version()};
                     err.set(http::field::content_type, "text/plain");
@@ -134,11 +134,100 @@ void http_server(const std::string &file_path, unsigned short port) {
                     err.prepare_payload();
                     http::write(sock, err);
                 } else {
-                    res.set(http::field::server, "CastServer");
-                    res.set(http::field::content_type, "video/mp4");
-                    res.set(http::field::access_control_allow_origin, "*");
-                    res.prepare_payload();
-                    http::write(sock, res);
+                    auto file_size = file.size(ec);
+                    if (ec) {
+                        http::response<http::string_body> err{http::status::internal_server_error, req.version()};
+                        err.set(http::field::content_type, "text/plain");
+                        err.body() = "File size error";
+                        err.prepare_payload();
+                        http::write(sock, err);
+                        return;
+                    }
+
+                    // Check for Range header
+                    auto range_header = req.find(http::field::range);
+                    if (range_header != req.end()) {
+                        // Parse Range: bytes=start-end
+                        std::string range_str = range_header->value();
+                        if (range_str.substr(0, 6) == "bytes=") {
+                            std::string range_spec = range_str.substr(6);
+                            size_t dash_pos = range_spec.find('-');
+                            
+                            if (dash_pos != std::string::npos) {
+                                std::string start_str = range_spec.substr(0, dash_pos);
+                                std::string end_str = range_spec.substr(dash_pos + 1);
+                                
+                                uint64_t start = 0, end = file_size - 1;
+                                
+                                // Parse start
+                                if (!start_str.empty()) {
+                                    start = std::stoull(start_str);
+                                }
+                                
+                                // Parse end  
+                                if (!end_str.empty()) {
+                                    end = std::stoull(end_str);
+                                }
+                                
+                                // Validate range
+                                if (start < file_size && end < file_size && start <= end) {
+                                    uint64_t content_length = end - start + 1;
+                                    
+                                    // Create 206 Partial Content response
+                                    http::response<http::string_body> res{http::status::partial_content, req.version()};
+                                    res.set(http::field::server, "CastServer");
+                                    res.set(http::field::content_type, "video/mp4");
+                                    res.set(http::field::access_control_allow_origin, "*");
+                                    res.set(http::field::accept_ranges, "bytes");
+                                    res.set(http::field::content_range, "bytes " + std::to_string(start) + "-" + std::to_string(end) + "/" + std::to_string(file_size));
+                                    res.set(http::field::content_length, std::to_string(content_length));
+                                    
+                                    // Read and send partial content
+                                    std::vector<char> buffer(std::min(content_length, (uint64_t)8192));
+                                    file.seek(start, ec);
+                                    if (ec) {
+                                        std::cout << "[HTTP] Seek error: " << ec.message() << "\n";
+                                        return;
+                                    }
+                                    
+                                    http::write(sock, res);
+                                    
+                                    uint64_t remaining = content_length;
+                                    while (remaining > 0) {
+                                        size_t to_read = std::min(remaining, (uint64_t)buffer.size());
+                                        size_t bytes_read = file.read(buffer.data(), to_read, ec);
+                                        if (ec || bytes_read == 0) break;
+                                        
+                                        boost::asio::write(sock, boost::asio::buffer(buffer.data(), bytes_read));
+                                        remaining -= bytes_read;
+                                    }
+                                    
+                                    std::cout << "[HTTP] Served range " << start << "-" << end << " (" << content_length << " bytes)\n";
+                                } else {
+                                    // Invalid range - return 416
+                                    http::response<http::string_body> err{http::status::range_not_satisfiable, req.version()};
+                                    err.set(http::field::content_range, "bytes */" + std::to_string(file_size));
+                                    err.prepare_payload();
+                                    http::write(sock, err);
+                                }
+                            }
+                        }
+                    } else {
+                        // No Range header - serve full file
+                        http::response<http::file_body> res{http::status::ok, req.version()};
+                        res.body().open(fp.c_str(), beast::file_mode::scan, ec);
+                        if (ec) {
+                            std::cout << "[HTTP] File open error for full serve: " << ec.message() << "\n";
+                            return;
+                        }
+                        res.set(http::field::server, "CastServer");
+                        res.set(http::field::content_type, "video/mp4");
+                        res.set(http::field::access_control_allow_origin, "*");
+                        res.set(http::field::accept_ranges, "bytes");
+                        res.prepare_payload();
+                        http::write(sock, res);
+                        std::cout << "[HTTP] Served full file (" << file_size << " bytes)\n";
+                    }
                 }
             
             // **Use sock.shutdown, not socket.shutdown**
@@ -218,7 +307,7 @@ int main(int argc, char **argv) {
     try {
         net::io_context ioc;
         tcp::resolver resolver(ioc);
-        tcp::resolver::results_type endpoints = resolver.resolve(tcp::v4(), cast_ip, "80");
+        tcp::resolver::results_type endpoints = resolver.resolve(tcp::v4(), cast_ip, "8008");
         tcp::socket socket(ioc);
         socket.connect(*endpoints.begin());
         local_ip = socket.local_endpoint().address().to_string();
@@ -227,7 +316,27 @@ int main(int argc, char **argv) {
     } catch (const std::exception& e) {
         std::cerr << "[ERROR] Failed to get local IP: " << e.what() << std::endl;
         std::cerr << "[INFO] Using fallback method to get local IP..." << std::endl;
-        local_ip = "192.168.1.0"; // fallback - will be auto-detected by HTTP server
+        // Try to connect to cast_ip on port 8008 instead of 80
+        try {
+            net::io_context ioc2;
+            tcp::resolver resolver2(ioc2);
+            tcp::resolver::results_type endpoints2 = resolver2.resolve(tcp::v4(), cast_ip, "8008");
+            tcp::socket socket2(ioc2);
+            socket2.connect(*endpoints2.begin());
+            local_ip = socket2.local_endpoint().address().to_string();
+            socket2.close();
+            std::cout << "[DEBUG] Fallback local IP: " << local_ip << std::endl;
+        } catch (const std::exception& e2) {
+            std::cerr << "[ERROR] Fallback also failed: " << e2.what() << std::endl;
+            // Last resort: parse from cast_ip assuming same subnet
+            size_t last_dot = cast_ip.find_last_of('.');
+            if (last_dot != std::string::npos) {
+                local_ip = cast_ip.substr(0, last_dot) + ".100"; // assume .100 as fallback
+                std::cout << "[DEBUG] Using subnet guess: " << local_ip << std::endl;
+            } else {
+                local_ip = "192.168.1.100";
+            }
+        }
     }
 
     // 3) Launch HTTP server
@@ -369,16 +478,8 @@ int main(int argc, char **argv) {
     socket.handshake(boost::asio::ssl::stream_base::client);
     std::cout << "[Cast] ✓ TLS connection established!\n";
 
-    // Launch Default Media Receiver via DIAL before Cast V2 handshake
-    std::cout << "[DEBUG] About to launch DIAL app on " << cast_ip << ":8008\n";
-    std::cout << "[DIAL] Launching Default Media Receiver via DIAL to avoid user confirmation...\n";
-    if (http_request("POST", "http://" + cast_ip + ":8008/apps/CC1AD845")) {
-        std::cout << "[DIAL] ✓ DIAL launch successful\n";
-    } else {
-        std::cout << "[DIAL] Warning: DIAL launch failed, proceeding anyway\n";
-    }
-    std::this_thread::sleep_for(std::chrono::seconds(3));  // give the app more time to fire up
-    std::cout << "[DEBUG] About to attempt TLS connection to " << cast_ip << ":8009\n";
+    // Skip DIAL - use pure Cast V2 protocol as per castv2 documentation
+    std::cout << "[Cast] Using pure Cast V2 protocol (no DIAL)\n";
 
     // Global variables for session management
     std::string session_id;
@@ -510,6 +611,7 @@ int main(int argc, char **argv) {
         launch_payload["type"] = "LAUNCH";
         launch_payload["requestId"] = request_counter++;
         launch_payload["appId"] = "CC1AD845";
+        std::cout << "[Cast] Launching Default Media Receiver...\n";
         send_cast_message("sender-0", "receiver-0", "urn:x-cast:com.google.cast.receiver",
                          Json::FastWriter().write(launch_payload));
         
@@ -553,6 +655,50 @@ int main(int argc, char **argv) {
             std::cout << "[Cast] Warning: Still no sessionId, app may not have launched properly\n";
             session_id = "DEFAULT_MEDIA_RECEIVER";
         }
+
+        // Wait for app to be fully ready - check statusText
+        std::cout << "[Cast] Waiting for app to be ready...\n";
+        for (int ready_attempts = 0; ready_attempts < 10; ready_attempts++) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+            
+            Json::Value ready_check;
+            ready_check["type"] = "GET_STATUS";
+            ready_check["requestId"] = request_counter++;
+            send_cast_message("sender-0", "receiver-0", "urn:x-cast:com.google.cast.receiver",
+                             Json::FastWriter().write(ready_check));
+            
+            auto ready_response = receive_cast_message();
+            if (!ready_response.payload_utf8().empty()) {
+                Json::Value ready_parsed;
+                Json::Reader reader;
+                if (reader.parse(ready_response.payload_utf8(), ready_parsed)) {
+                    std::cout << "[DEBUG] Full status response: " << ready_response.payload_utf8() << "\n";
+                    if (ready_parsed["status"]["applications"].isArray()) {
+                        std::cout << "[DEBUG] Number of running apps: " << ready_parsed["status"]["applications"].size() << "\n";
+                        for (int i = 0; i < ready_parsed["status"]["applications"].size(); i++) {
+                            auto app = ready_parsed["status"]["applications"][i];
+                            std::cout << "[DEBUG] App " << i << ": " << app["appId"].asString() 
+                                      << " status: " << app["statusText"].asString() << "\n";
+                        }
+                        if (ready_parsed["status"]["applications"].size() > 0) {
+                            std::string statusText = ready_parsed["status"]["applications"][0]["statusText"].asString();
+                            std::cout << "[Cast] App status: " << statusText << "\n";
+                            if (statusText == "Ready To Cast" || statusText == "Default Media Receiver") {
+                                std::cout << "[Cast] ✓ App is ready!\n";
+                                break;
+                            }
+                        }
+                    } else {
+                        std::cout << "[DEBUG] No applications array in status\n";
+                    }
+                } else {
+                    std::cout << "[DEBUG] Failed to parse status response\n";
+                }
+            } else {
+                std::cout << "[DEBUG] Empty ready response\n";
+            }
+            std::cout << "[Cast] App not ready yet, waiting... (" << (ready_attempts + 1) << "/10)\n";
+        }
         
         std::this_thread::sleep_for(std::chrono::milliseconds(2000));
 
@@ -585,23 +731,60 @@ int main(int argc, char **argv) {
         std::cout << "[Cast] ✓ sessionId=" << session_id << "\n";
         std::cout << "[Cast] ✓ Check your TV! Video should start playing now.\n";
 
-        response = receive_cast_message();
-        
-        // Check if LOAD was successful
-        if (!response.payload_utf8().empty()) {
-            Json::Value load_response;
-            Json::Reader reader;
-            if (reader.parse(response.payload_utf8(), load_response)) {
-                if (load_response["type"].asString() == "MEDIA_STATUS") {
-                    std::cout << "[Cast] ✓ Received MEDIA_STATUS - video should be loading!\n";
-                } else if (load_response["type"].asString() == "LOAD_FAILED") {
-                    std::cout << "[Cast] ✗ LOAD_FAILED: " << load_response["reason"].asString() << "\n";
-                } else {
-                    std::cout << "[Cast] Got response: " << load_response["type"].asString() << "\n";
+        // Keep looking for media response, not just heartbeat
+        for (int attempts = 0; attempts < 10; attempts++) {
+            response = receive_cast_message();
+            
+            if (!response.payload_utf8().empty()) {
+                Json::Value load_response;
+                Json::Reader reader;
+                if (reader.parse(response.payload_utf8(), load_response)) {
+                    std::string msgType = load_response["type"].asString();
+                    if (msgType == "MEDIA_STATUS") {
+                        std::cout << "[Cast] ✓ Received MEDIA_STATUS - video should be loading!\n";
+                        std::cout << "[Cast] MEDIA_STATUS details: " << response.payload_utf8() << "\n";
+                        
+                        // Check if media is IDLE (paused) and send PLAY command
+                        if (load_response["status"].isArray() && load_response["status"].size() > 0) {
+                            std::string playerState = load_response["status"][0]["playerState"].asString();
+                            int mediaSessionId = load_response["status"][0]["mediaSessionId"].asInt();
+                            
+                            std::cout << "[Cast] Player state: " << playerState << ", mediaSessionId: " << mediaSessionId << "\n";
+                            
+                            if (playerState == "IDLE") {
+                                std::cout << "[Cast] Media is IDLE, sending PLAY command...\n";
+                                Json::Value play_payload;
+                                play_payload["type"] = "PLAY";
+                                play_payload["requestId"] = request_counter++;
+                                play_payload["mediaSessionId"] = mediaSessionId;
+                                
+                                send_cast_message("sender-0", session_id, "urn:x-cast:com.google.cast.media",
+                                                 Json::FastWriter().write(play_payload));
+                                std::cout << "[Cast] ✓ PLAY command sent!\n";
+                                
+                                // Wait for PLAY response to confirm it worked
+                                std::cout << "[Cast] Waiting for PLAY response...\n";
+                                auto play_response = receive_cast_message();
+                                if (!play_response.payload_utf8().empty()) {
+                                    std::cout << "[Cast] PLAY response: " << play_response.payload_utf8() << "\n";
+                                }
+                            }
+                        }
+                        break;
+                    } else if (msgType == "LOAD_FAILED") {
+                        std::cout << "[Cast] ✗ LOAD_FAILED: " << load_response["reason"].asString() << "\n";
+                        std::cout << "[Cast] Full error: " << response.payload_utf8() << "\n";
+                        break;
+                    } else if (msgType == "PONG") {
+                        std::cout << "[Cast] Got heartbeat PONG, continuing to wait for media response...\n";
+                        continue;
+                    } else {
+                        std::cout << "[Cast] Got response: " << msgType << " - " << response.payload_utf8() << "\n";
+                    }
                 }
+            } else {
+                std::cout << "[Cast] Empty response on attempt " << (attempts+1) << "\n";
             }
-        } else {
-            std::cout << "[Cast] No response to LOAD, media may still be starting...\n";
         }
         
         // Wait a bit for the media to start, then keep monitoring playback
