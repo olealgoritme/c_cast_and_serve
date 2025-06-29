@@ -16,3 +16,27 @@ message CastMessage {
   optional string payload_utf8 = 6;
   optional bytes payload_binary = 7;
 }
+
+// Device Authentication Messages
+message AuthChallenge {
+}
+
+message AuthResponse {
+  required bytes signature = 1;
+  required bytes client_auth_certificate = 2;
+  repeated bytes client_ca = 3;
+}
+
+message AuthError {
+  enum ErrorType {
+    INTERNAL_ERROR = 0;
+    NO_TLS = 1;  // The underlying connection is not TLS
+  }
+  required ErrorType error_type = 1;
+}
+
+message DeviceAuthMessage {
+  optional AuthChallenge challenge = 1;
+  optional AuthResponse response = 2;
+  optional AuthError error = 3;
+}
