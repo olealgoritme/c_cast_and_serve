@@ -27,9 +27,6 @@
 #include <mutex>
 #include <limits>
 #include <atomic>
-#include <filesystem>
-#include <algorithm>
-#include <queue>
 
 namespace beast = boost::beast;
 namespace http  = beast::http;
